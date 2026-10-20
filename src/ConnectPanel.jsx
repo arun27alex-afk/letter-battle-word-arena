@@ -1,9 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { updateProfile } from 'firebase/auth'
-import { addDoc, collection, doc, getDoc, onSnapshot, orderBy, query, serverTimestamp, setDoc } from 'firebase/firestore'
+import { addDoc, collection, onSnapshot, orderBy, query, serverTimestamp } from 'firebase/firestore'
 import { auth, db } from './firebase'
 
-const rtcConfig = { iceServers: [{ urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] }] }
+const MAX_RECORDING_SECONDS = 15
+const MAX_AUDIO_BYTES = 600 * 1024
+
+const blobToDataUrl = blob => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => resolve(reader.result)
+  reader.onerror = reject
+  reader.readAsDataURL(blob)
+})
 
 export default function ConnectPanel({ room }) {
   const [open, setOpen] = useState(false)
@@ -11,12 +19,14 @@ export default function ConnectPanel({ room }) {
   const [messages, setMessages] = useState([])
   const [message, setMessage] = useState('')
   const [name, setName] = useState(auth.currentUser?.displayName || '')
-  const [voiceStatus, setVoiceStatus] = useState('Not connected')
-  const [inVoice, setInVoice] = useState(false)
-  const [muted, setMuted] = useState(false)
-  const pcRef = useRef(null)
+  const [recording, setRecording] = useState(false)
+  const [recordingSeconds, setRecordingSeconds] = useState(0)
+  const [voiceStatus, setVoiceStatus] = useState('Tap record to send a voice message.')
+  const recorderRef = useRef(null)
   const streamRef = useRef(null)
-  const audioRef = useRef(null)
+  const chunksRef = useRef([])
+  const timerRef = useRef(null)
+  const recordingSecondsRef = useRef(0)
 
   useEffect(() => {
     if (!auth.currentUser || !room) return undefined
@@ -24,10 +34,18 @@ export default function ConnectPanel({ room }) {
     return onSnapshot(messagesQuery, snapshot => setMessages(snapshot.docs.slice(-50).map(item => ({ id: item.id, ...item.data() }))), () => setMessages([]))
   }, [room])
 
+  useEffect(() => () => {
+    clearInterval(timerRef.current)
+    streamRef.current?.getTracks().forEach(track => track.stop())
+  }, [])
+
   const sendMessage = async event => {
     event.preventDefault()
     if (!message.trim() || !room) return
-    await addDoc(collection(db, 'rooms', room, 'messages'), { text: message.trim().slice(0, 300), uid: auth.currentUser.uid, name: auth.currentUser.displayName, createdAt: serverTimestamp() })
+    await addDoc(collection(db, 'rooms', room, 'messages'), {
+      type: 'text', text: message.trim().slice(0, 300), uid: auth.currentUser.uid,
+      name: auth.currentUser.displayName, createdAt: serverTimestamp(),
+    })
     setMessage('')
   }
 
@@ -37,47 +55,71 @@ export default function ConnectPanel({ room }) {
     setName(auth.currentUser.displayName)
   }
 
-  const startVoice = async () => {
-    try {
-      setVoiceStatus('Requesting microphone…')
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-      setInVoice(true)
-      streamRef.current = stream
-      const pc = new RTCPeerConnection(rtcConfig); pcRef.current = pc
-      stream.getTracks().forEach(track => pc.addTrack(track, stream))
-      pc.ontrack = event => { audioRef.current.srcObject = event.streams[0]; setVoiceStatus('Voice connected') }
-      pc.onconnectionstatechange = () => { if (pc.connectionState === 'connected') setVoiceStatus('Voice connected') }
-      const callRef = doc(db, 'rooms', room, 'voice', 'call')
-      const callSnapshot = await getDoc(callRef)
-      if (!callSnapshot.exists() || !callSnapshot.data().offer) {
-        const offerCandidates = collection(callRef, 'offerCandidates')
-        pc.onicecandidate = event => event.candidate && addDoc(offerCandidates, event.candidate.toJSON())
-        const offer = await pc.createOffer(); await pc.setLocalDescription(offer)
-        await setDoc(callRef, { offer: { type: offer.type, sdp: offer.sdp }, createdBy: auth.currentUser.uid, updatedAt: serverTimestamp() })
-        onSnapshot(callRef, snapshot => { const answer = snapshot.data()?.answer; if (answer && !pc.currentRemoteDescription) pc.setRemoteDescription(answer) })
-        onSnapshot(collection(callRef, 'answerCandidates'), snapshot => snapshot.docChanges().forEach(change => { if (change.type === 'added') pc.addIceCandidate(change.doc.data()) }))
-        setVoiceStatus('Waiting for opponent…')
-      } else {
-        const answerCandidates = collection(callRef, 'answerCandidates')
-        pc.onicecandidate = event => event.candidate && addDoc(answerCandidates, event.candidate.toJSON())
-        await pc.setRemoteDescription(callSnapshot.data().offer)
-        const answer = await pc.createAnswer(); await pc.setLocalDescription(answer)
-        await setDoc(callRef, { answer: { type: answer.type, sdp: answer.sdp }, answeredBy: auth.currentUser.uid, updatedAt: serverTimestamp() }, { merge: true })
-        onSnapshot(collection(callRef, 'offerCandidates'), snapshot => snapshot.docChanges().forEach(change => { if (change.type === 'added') pc.addIceCandidate(change.doc.data()) }))
-        setVoiceStatus('Connecting…')
-      }
-    } catch { setInVoice(false); setVoiceStatus('Microphone/Firestore permission needed') }
+  const stopRecording = () => {
+    clearInterval(timerRef.current)
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
   }
 
-  const endVoice = () => { streamRef.current?.getTracks().forEach(track => track.stop()); pcRef.current?.close(); streamRef.current = null; pcRef.current = null; setMuted(false); setInVoice(false); setVoiceStatus('Not connected') }
-  const toggleMute = () => { const next = !muted; streamRef.current?.getAudioTracks().forEach(track => { track.enabled = !next }); setMuted(next) }
+  const startRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setVoiceStatus('Voice recording is not supported by this browser.')
+      return
+    }
+    try {
+      setVoiceStatus('Requesting microphone permission...')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      streamRef.current = stream
+      chunksRef.current = []
+      const preferredType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : ''
+      const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType, audioBitsPerSecond: 24000 } : undefined)
+      recorderRef.current = recorder
+      recorder.ondataavailable = event => { if (event.data.size) chunksRef.current.push(event.data) }
+      recorder.onstop = async () => {
+        clearInterval(timerRef.current)
+        stream.getTracks().forEach(track => track.stop())
+        streamRef.current = null
+        setRecording(false)
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' })
+        if (!blob.size) return setVoiceStatus('No audio was recorded. Please try again.')
+        if (blob.size > MAX_AUDIO_BYTES) return setVoiceStatus('Recording is too large. Please record a shorter message.')
+        try {
+          setVoiceStatus('Sending voice message...')
+          const audioData = await blobToDataUrl(blob)
+          await addDoc(collection(db, 'rooms', room, 'messages'), {
+            type: 'audio', audioData, audioMime: blob.type, duration: recordingSecondsRef.current,
+            uid: auth.currentUser.uid, name: auth.currentUser.displayName, createdAt: serverTimestamp(),
+          })
+          setVoiceStatus('Voice message sent.')
+          setTab('chat')
+        } catch {
+          setVoiceStatus('Unable to send the voice message. Please try again.')
+        }
+      }
+      setRecordingSeconds(0)
+      recordingSecondsRef.current = 0
+      setRecording(true)
+      setVoiceStatus('Recording... tap Stop & Send when finished.')
+      recorder.start(500)
+      timerRef.current = setInterval(() => {
+        setRecordingSeconds(seconds => {
+          const next = Math.min(seconds + 1, MAX_RECORDING_SECONDS)
+          recordingSecondsRef.current = next
+          if (next >= MAX_RECORDING_SECONDS) stopRecording()
+          return next
+        })
+      }, 1000)
+    } catch {
+      setRecording(false)
+      setVoiceStatus('Microphone permission is required to record voice messages.')
+    }
+  }
 
   return <><button className="connect-fab" onClick={() => setOpen(value => !value)}>{open ? '×' : 'Chat & Voice'}</button>{open && <section className="connect-panel">
     <header><div><small>ONLINE ROOM</small><strong>{room || 'NO ROOM'}</strong></div><span>{auth.currentUser?.displayName}</span></header>
     <div className="room-field"><label>PRIVATE BATTLE ROOM</label><input value={room} readOnly /></div>
-    <nav><button className={tab === 'chat' ? 'active' : ''} onClick={() => setTab('chat')}>Text chat</button><button className={tab === 'voice' ? 'active' : ''} onClick={() => setTab('voice')}>Voice</button><button className={tab === 'profile' ? 'active' : ''} onClick={() => setTab('profile')}>Profile</button></nav>
-    {tab === 'chat' && <><div className="messages">{messages.length ? messages.map(item => <div className={item.uid === auth.currentUser.uid ? 'mine' : ''} key={item.id}><b>{item.name}</b><p>{item.text}</p></div>) : <p className="chat-empty">No messages in this battle yet.</p>}</div><form className="message-form" onSubmit={sendMessage}><input value={message} onChange={event => setMessage(event.target.value)} placeholder="Type a message…" /><button>Send</button></form></>}
-    {tab === 'voice' && <div className="voice-box"><span className={voiceStatus === 'Voice connected' ? 'connected' : ''}>●</span><h3>{voiceStatus}</h3><p>Both players must join voice from the same battle room.</p>{!inVoice ? <button onClick={startVoice}>Join voice</button> : <div><button onClick={toggleMute}>{muted ? 'Unmute' : 'Mute'}</button><button className="danger" onClick={endVoice}>Leave</button></div>}<audio ref={audioRef} autoPlay /></div>}
-    {tab === 'profile' && <div className="profile-box"><label>PLAYER NAME</label><input value={name} onChange={event => setName(event.target.value.slice(0, 20))} /><button onClick={saveName}>Save name</button><small>{auth.currentUser?.phoneNumber}</small></div>}
+    <nav><button className={tab === 'chat' ? 'active' : ''} onClick={() => setTab('chat')}>Text chat</button><button className={tab === 'voice' ? 'active' : ''} onClick={() => setTab('voice')}>Voice note</button><button className={tab === 'profile' ? 'active' : ''} onClick={() => setTab('profile')}>Profile</button></nav>
+    {tab === 'chat' && <><div className="messages">{messages.length ? messages.map(item => <div className={item.uid === auth.currentUser.uid ? 'mine' : ''} key={item.id}><b>{item.name}</b>{item.type === 'audio' ? <div className="voice-message"><span>Voice message</span><audio controls preload="metadata" src={item.audioData} /></div> : <p>{item.text}</p>}</div>) : <p className="chat-empty">No messages in this battle yet.</p>}</div><form className="message-form" onSubmit={sendMessage}><input value={message} onChange={event => setMessage(event.target.value)} placeholder="Type a message..." /><button>Send</button></form></>}
+    {tab === 'voice' && <div className="voice-box"><span className={recording ? 'recording-dot' : ''}>●</span><h3>{recording ? `${recordingSeconds}s / ${MAX_RECORDING_SECONDS}s` : 'Voice message'}</h3><p>{voiceStatus}</p>{recording ? <button className="danger" onClick={stopRecording}>Stop & Send</button> : <button onClick={startRecording}>Record voice</button>}</div>}
+    {tab === 'profile' && <div className="profile-box"><label>PLAYER NAME</label><input value={name} onChange={event => setName(event.target.value.slice(0, 20))} /><button onClick={saveName}>Save name</button><small>{auth.currentUser?.email}</small></div>}
   </section>}</>
 }
