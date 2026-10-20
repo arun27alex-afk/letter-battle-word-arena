@@ -25,7 +25,13 @@ function Icon({ name, size = 20 }) {
 const boardToRows = board => Array.from({ length: SIZE }, (_, row) => board.slice(row * SIZE, row * SIZE + SIZE))
 
 export default function AppOnline() {
-  const [roomCode, setRoomCode] = useState(() => localStorage.getItem('letter-battle-active-room') || '')
+  const [roomCode, setRoomCode] = useState(() => {
+    const invitedRoom = new URLSearchParams(location.search).get('room')?.trim().toUpperCase()
+    const savedRoom = localStorage.getItem('letter-battle-active-room') || ''
+    // An invite for a different room must open the join screen instead of a
+    // previously saved battle where this browser may be Player 1.
+    return invitedRoom && invitedRoom !== savedRoom ? '' : savedRoom
+  })
   const [room, setRoom] = useState(null)
   const [notice, setNotice] = useState({ type: 'info', text: 'Connecting to battle…' })
   const [checking, setChecking] = useState(false)
