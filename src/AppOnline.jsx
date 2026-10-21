@@ -16,6 +16,10 @@ const COMMON_WORDS = new Set([
 const TWO_LETTER_WORDS = new Set(['am','an','as','at','be','by','do','go','he','if','in','is','it','me','my','no','of','oh','ok','on','or','ox','so','to','up','us','we'])
 const HARD_BLOCKED = new Set(['a','an','the','am','is','are','was','were','be','been','being','do','does','did','have','has','had','can','could','may','might','must','shall','should','will','would','i','me','my','mine','we','us','our','ours','you','your','yours','he','him','his','she','her','hers','it','its','they','them','their','theirs','this','that','these','those','who','whom','whose','which','what','and','but','or','nor','for','yet','so','if','because','although','while','than','then','not','no','yes','about','above','across','after','against','along','among','around','as','at','before','behind','below','beneath','beside','between','beyond','by','despite','down','during','except','from','in','inside','into','near','of','off','on','onto','opposite','out','outside','over','past','through','to','toward','under','underneath','until','up','upon','with','within','without'])
 const cellId = (row, col) => `${row}-${col}`
+const wordFromCommittedCells = (board, cells) => cells.map(id => {
+  const [row, col] = id.split('-').map(Number)
+  return board[row * SIZE + col]
+}).join('').toLowerCase()
 
 function Icon({ name, size = 20 }) {
   const paths = { users: <><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></>, refresh: <><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></>, book: <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></>, spark: <path d="m12 3-1.8 4.2L6 9l4.2 1.8L12 15l1.8-4.2L18 9l-4.2-1.8L12 3Z"/>, arrow: <><path d="M5 12h14M13 6l6 6-6 6"/></> }
@@ -100,7 +104,10 @@ export default function AppOnline() {
           board: nextBoard,
           locked: nextLocked,
           scores: { ...latest.scores, [auth.currentUser.uid]: (latest.scores?.[auth.currentUser.uid] || 0) + earned },
-          words: [...valid.map(word => ({ text: word.text, cells: word.cells, axis: word.axis, playerUid: auth.currentUser.uid, points: word.text.length })), ...(latest.words || [])].slice(0, 100),
+          words: [...valid.map(word => {
+            const committedText = wordFromCommittedCells(nextBoard, word.cells)
+            return { text: committedText, cells: word.cells, axis: word.axis, playerUid: auth.currentUser.uid, points: committedText.length }
+          }), ...(latest.words || [])].slice(0, 100),
           turnUid: valid.length ? auth.currentUser.uid : opponent.uid,
           revision: latest.revision + 1,
           updatedAt: serverTimestamp(),
