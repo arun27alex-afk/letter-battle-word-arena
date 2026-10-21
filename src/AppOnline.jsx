@@ -75,6 +75,24 @@ export default function AppOnline() {
     return { text: text.toLowerCase(), cells, axis }
   }
 
+  const makeCandidates = (board, locked, row, col) => {
+    const horizontal = readLine(board, locked, row, col, 'horizontal')
+    const vertical = readLine(board, locked, row, col, 'vertical')
+    const candidates = []
+    if (horizontal.text.length >= 2) candidates.push({ ...horizontal, lineKey: horizontal.cells.join('|') })
+    if (vertical.text.length >= 2) {
+      const lineKey = vertical.cells.join('|')
+      candidates.push({ ...vertical, lineKey })
+      candidates.push({
+        text: [...vertical.text].reverse().join(''),
+        cells: [...vertical.cells].reverse(),
+        axis: 'vertical-reverse',
+        lineKey,
+      })
+    }
+    return candidates
+  }
+
   const checkWord = async word => {
     if (word.length === 2) return TWO_LETTER_WORDS.has(word)
     if (COMMON_WORDS.has(word)) return true
@@ -87,11 +105,14 @@ export default function AppOnline() {
     const letter = raw.replace(/[^a-z]/gi, '').slice(-1).toUpperCase(); if (!letter) return
     setChecking(true); setNotice({ type: 'ready', text: 'Checking the move…' })
     const proposedBoard = [...room.board]; proposedBoard[row * SIZE + col] = letter
-    const candidates = [readLine(proposedBoard, room.locked || {}, row, col, 'horizontal'), readLine(proposedBoard, room.locked || {}, row, col, 'vertical')].filter(item => item.text.length >= 2)
+    const candidates = makeCandidates(proposedBoard, room.locked || {}, row, col)
     const unique = candidates.filter((item, index) => candidates.findIndex(other => other.text === item.text) === index && !(room.words || []).some(word => word.text === item.text))
     const checked = await Promise.all(unique.map(async item => ({ ...item, valid: await checkWord(item.text) })))
     const blocked = checked.some(item => item.valid && room.mode === 'hard' && HARD_BLOCKED.has(item.text))
-    const valid = checked.filter(item => item.valid && !(room.mode === 'hard' && HARD_BLOCKED.has(item.text)))
+    const eligible = checked.filter(item => item.valid && !(room.mode === 'hard' && HARD_BLOCKED.has(item.text)))
+    // A vertical line can be valid in both directions (for example NO / ON).
+    // Score only the first valid direction for the same physical cells.
+    const valid = eligible.filter((item, index) => eligible.findIndex(other => other.lineKey === item.lineKey) === index)
     try {
       await runTransaction(db, async transaction => {
         const roomRef = doc(db, 'rooms', roomCode); const snapshot = await transaction.get(roomRef); const latest = snapshot.data()
